@@ -7,11 +7,13 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	go_sql "database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"io"
 	"io/ioutil"
 	"math"
@@ -268,8 +270,8 @@ var dbTypeMap = map[string]bool{DBTYPE_PG: true, DBTYPE_PG_CONT: true, DBTYPE_BO
 var dbTypes = []string{DBTYPE_PG, DBTYPE_PG_CONT, DBTYPE_BOUNCER, DBTYPE_PATRONI, DBTYPE_PATRONI_CONT, DBTYPE_PATRONI_NAMESPACE_DISCOVERY} // used for informational purposes
 var specialMetrics = map[string]bool{RECO_METRIC_NAME: true, SPECIAL_METRIC_CHANGE_EVENTS: true, SPECIAL_METRIC_SERVER_LOG_EVENT_COUNTS: true}
 var directlyFetchableOSMetrics = map[string]bool{METRIC_PSUTIL_CPU: true, METRIC_PSUTIL_DISK: true, METRIC_PSUTIL_DISK_IO_TOTAL: true, METRIC_PSUTIL_MEM: true, METRIC_CPU_LOAD: true}
-var configDb *sqlx.DB
-var metricDb *sqlx.DB
+var configDb *pgxpool.Pool
+var metricDb *pgxpool.Pool
 var graphiteConnection *graphite.Graphite
 var graphite_host string
 var graphite_port int
@@ -282,7 +284,7 @@ var db_pg_version_map_lock = sync.RWMutex{}
 var db_get_pg_version_map_lock = make(map[string]sync.RWMutex) // synchronize initial PG version detection to 1 instance for each defined host
 var monitored_db_cache map[string]MonitoredDatabase
 var monitored_db_cache_lock sync.RWMutex
-var monitored_db_conn_cache map[string]*sqlx.DB = make(map[string]*sqlx.DB)
+var monitored_db_conn_cache map[string]*pgxpool.Pool = make(map[string]*pgxpool.Pool)
 var monitored_db_conn_cache_lock = sync.RWMutex{}
 var last_sql_fetch_error sync.Map
 var influx_host_count = 1
@@ -305,7 +307,6 @@ var totalMetricsDroppedCounter uint64
 var totalDatasetsFetchedCounter uint64
 var metricPointsPerMinuteLast5MinAvg int64 = -1 // -1 means the summarization ticker has not yet run
 var gathererStartTime time.Time = time.Now()
-var useConnPooling bool
 var partitionMapMetric = make(map[string]ExistingPartitionInfo)                  // metric = min/max bounds
 var partitionMapMetricDbname = make(map[string]map[string]ExistingPartitionInfo) // metric[dbname = min/max bounds]
 var testDataGenerationModeWG sync.WaitGroup
@@ -360,34 +361,25 @@ func IsPostgresDBType(dbType string) bool {
 	return true
 }
 
-func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password, sslmode, sslrootcert, sslcert, sslkey string) (*sqlx.DB, error) {
+func paramsExists(connectionString string) bool {
+	re := regexp.MustCompile("(postgres(?:ql)?)://(?:([^@\\s]+)@)?([^/\\s]+)(?:\\/(\\w+))?(?:\\?(?P<params>.+))?")
+	matches := re.FindStringSubmatch(connectionString)
+	return matches[re.SubexpIndex("params")] != ""
+}
+
+func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password, sslmode, sslrootcert, sslcert, sslkey string) (*pgxpool.Pool, error) {
 	var connStr string
 
 	//log.Debug("Connecting to: ", host, port, dbname, user, password)
 	if len(libPqConnString) > 0 {
+		if !strings.Contains("application_name", libPqConnString) {
+			if !paramsExists(libPqConnString) {
+				libPqConnString += fmt.Sprintf("?application_name=%s", APPLICATION_NAME)
+			} else {
+				libPqConnString += fmt.Sprintf("&application_name=%s", APPLICATION_NAME)
+			}
+		}
 		connStr = libPqConnString
-		if !strings.Contains(strings.ToLower(connStr), "sslmode") {
-			if strings.Contains(connStr, "postgresql://") || strings.Contains(connStr, "postgres://") { // JDBC style
-				if strings.Contains(connStr, "?") { // has some extra params already
-					connStr += "&sslmode=disable" // defaulting to "disable" as Go driver doesn't support "prefer"
-				} else {
-					connStr += "?sslmode=disable"
-				}
-			} else { // LibPQ style
-				connStr += " sslmode=disable"
-			}
-		}
-		if !strings.Contains(strings.ToLower(connStr), "connect_timeout") {
-			if strings.Contains(connStr, "postgresql://") || strings.Contains(connStr, "postgres://") { // JDBC style
-				if strings.Contains(connStr, "?") { // has some extra params already
-					connStr += "&connect_timeout=5" // 5 seconds
-				} else {
-					connStr += "?connect_timeout=5"
-				}
-			} else { // LibPQ style
-				connStr += " connect_timeout=5"
-			}
-		}
 	} else {
 		connStr = fmt.Sprintf("host=%s port=%s dbname='%s' sslmode=%s user=%s application_name=%s sslrootcert='%s' sslcert='%s' sslkey='%s' connect_timeout=5",
 			host, port, dbname, sslmode, user, APPLICATION_NAME, sslrootcert, sslcert, sslkey)
@@ -396,7 +388,7 @@ func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password
 		}
 	}
 
-	return sqlx.Open("postgres", connStr)
+	return pgxpool.New(context.Background(), connStr)
 }
 
 func StringToBoolOrFail(boolAsString, inputParamName string) bool {
@@ -442,7 +434,7 @@ func InitAndTestConfigStoreConnection(host, port, dbname, user, password, requir
 			}
 		}
 
-		err = configDb.Ping()
+		err = configDb.Ping(context.Background())
 
 		if err != nil {
 			if i < retries {
@@ -461,9 +453,10 @@ func InitAndTestConfigStoreConnection(host, port, dbname, user, password, requir
 			break
 		}
 	}
-	configDb.SetMaxIdleConns(1)
-	configDb.SetMaxOpenConns(2)
-	configDb.SetConnMaxLifetime(time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS))
+
+	configDb.Config().MaxConnLifetime = time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS)
+	configDb.Config().MinConns = 2
+
 	return nil
 }
 
@@ -488,7 +481,7 @@ func InitAndTestMetricStoreConnection(connStr string, failOnErr bool) error {
 			}
 		}
 
-		err = metricDb.Ping()
+		err = metricDb.Ping(context.Background())
 
 		if err != nil {
 			if i < retries {
@@ -506,9 +499,10 @@ func InitAndTestMetricStoreConnection(connStr string, failOnErr bool) error {
 			break
 		}
 	}
-	metricDb.SetMaxIdleConns(2)
-	metricDb.SetMaxOpenConns(2)
-	metricDb.SetConnMaxLifetime(time.Second * 172800) // 2d
+
+	metricDb.Config().MaxConnLifetime = time.Second * 172800 // 2d
+	metricDb.Config().MinConns = 2
+
 	return nil
 }
 
@@ -532,14 +526,10 @@ func InitSqlConnPoolForMonitoredDBIfNil(md MonitoredDatabase) error {
 		return err
 	}
 
-	if useConnPooling {
-		conn.SetMaxIdleConns(opts.MaxParallelConnectionsPerDb)
-	} else {
-		conn.SetMaxIdleConns(0)
-	}
-	conn.SetMaxOpenConns(opts.MaxParallelConnectionsPerDb)
+	conn.Config().MaxConnIdleTime = time.Second * 3600 // 1 hour
+	conn.Config().MaxConns = int32(opts.MaxParallelConnectionsPerDb)
 	// recycling periodically makes sense as long sessions might bloat memory or maybe conn info (password) was changed
-	conn.SetConnMaxLifetime(time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS))
+	conn.Config().MaxConnLifetime = time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS)
 
 	monitored_db_conn_cache[md.DBUniqueName] = conn
 	log.Debugf("[%s] Connection pool initialized with max %d parallel connections. Conn pooling: %v", md.DBUniqueName, opts.MaxParallelConnectionsPerDb, useConnPooling)
@@ -558,18 +548,15 @@ func CloseOrLimitSqlConnPoolForMonitoredDBIfAny(dbUnique string) {
 
 	if IsDBUndersized(dbUnique) || IsDBIgnoredBasedOnRecoveryState(dbUnique) {
 
-		if useConnPooling {
-			s := conn.Stats()
-			if s.MaxOpenConnections > 1 {
-				log.Debugf("[%s] Limiting SQL connection pool to max 1 connection due to dormant state ...", dbUnique)
-				conn.SetMaxIdleConns(1)
-				conn.SetMaxOpenConns(1)
-			}
+		s := conn.Stat()
+		if s.MaxConns() > 1 {
+			log.Debugf("[%s] Limiting SQL connection pool to max 1 connection due to dormant state ...", dbUnique)
+			conn.Config().MaxConns = 1
 		}
 
 	} else { // removed from config
 		log.Debugf("[%s] Closing SQL connection pool ...", dbUnique)
-		err := conn.Close()
+		err := conn.Close
 		if err != nil {
 			log.Error("[%s] Failed to close connection pool to %s nicely. Err: %v", dbUnique, err)
 		}
@@ -578,9 +565,7 @@ func CloseOrLimitSqlConnPoolForMonitoredDBIfAny(dbUnique string) {
 }
 
 func RestoreSqlConnPoolLimitsForPreviouslyDormantDB(dbUnique string) {
-	if !useConnPooling {
-		return
-	}
+
 	monitored_db_conn_cache_lock.Lock()
 	defer monitored_db_conn_cache_lock.Unlock()
 
@@ -592,8 +577,7 @@ func RestoreSqlConnPoolLimitsForPreviouslyDormantDB(dbUnique string) {
 
 	log.Debugf("[%s] Re-instating SQL connection pool max connections ...", dbUnique)
 
-	conn.SetMaxIdleConns(opts.MaxParallelConnectionsPerDb)
-	conn.SetMaxOpenConns(opts.MaxParallelConnectionsPerDb)
+	conn.Config().MaxConns = int32(opts.MaxParallelConnectionsPerDb)
 
 }
 
@@ -605,16 +589,16 @@ func InitPGVersionInfoFetchingLockIfNil(md MonitoredDatabase) {
 	db_pg_version_map_lock.Unlock()
 }
 
-func DBExecRead(conn *sqlx.DB, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
+func DBExecRead(conn *pgxpool.Pool, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
 	ret := make([]map[string]interface{}, 0)
-	var rows *sqlx.Rows
+	var rows pgx.Rows
 	var err error
 
 	if conn == nil {
 		return nil, errors.New("nil connection")
 	}
 
-	rows, err = conn.Queryx(sql, args...)
+	rows, err = conn.Query(context.Background(), sql, args...)
 
 	if err != nil {
 		// connection problems or bad queries etc are quite common so caller should decide if to output something
@@ -625,7 +609,7 @@ func DBExecRead(conn *sqlx.DB, host_ident, sql string, args ...interface{}) ([](
 
 	for rows.Next() {
 		row := make(map[string]interface{})
-		err = rows.MapScan(row)
+		err = rows.Scan(row)
 		if err != nil {
 			log.Error("failed to MapScan a result row", host_ident, err)
 			return nil, err
@@ -640,9 +624,9 @@ func DBExecRead(conn *sqlx.DB, host_ident, sql string, args ...interface{}) ([](
 	return ret, err
 }
 
-func DBExecInExplicitTX(conn *sqlx.DB, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
+func DBExecInExplicitTX(conn *pgxpool.Pool, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
 	ret := make([]map[string]interface{}, 0)
-	var rows *sqlx.Rows
+	var rows pgx.Rows
 	var err error
 
 	if conn == nil {
@@ -650,15 +634,17 @@ func DBExecInExplicitTX(conn *sqlx.DB, host_ident, sql string, args ...interface
 	}
 
 	ctx := context.Background()
-	txOpts := go_sql.TxOptions{ReadOnly: true}
+	txOpts := &pgx.TxOptions{
+		AccessMode: pgx.ReadOnly,
+	}
 
-	tx, err := conn.BeginTxx(ctx, &txOpts)
+	tx, err := conn.BeginTx(ctx, *txOpts)
 	if err != nil {
 		return ret, err
 	}
-	defer tx.Commit()
+	defer tx.Commit(ctx)
 
-	rows, err = tx.Queryx(sql, args...)
+	rows, err = tx.Query(ctx, sql, args...)
 
 	if err != nil {
 		// connection problems or bad queries etc are quite common so caller should decide if to output something
@@ -669,9 +655,9 @@ func DBExecInExplicitTX(conn *sqlx.DB, host_ident, sql string, args ...interface
 
 	for rows.Next() {
 		row := make(map[string]interface{})
-		err = rows.MapScan(row)
+		err = rows.Scan(row)
 		if err != nil {
-			log.Error("failed to MapScan a result row", host_ident, err)
+			log.Error("failed to Scan a result row", host_ident, err)
 			return nil, err
 		}
 		ret = append(ret, row)
@@ -685,7 +671,7 @@ func DBExecInExplicitTX(conn *sqlx.DB, host_ident, sql string, args ...interface
 }
 
 func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride int64, sql string, args ...interface{}) ([](map[string]interface{}), error, time.Duration) {
-	var conn *sqlx.DB
+	var conn *pgxpool.Pool
 	var md MonitoredDatabase
 	var data [](map[string]interface{})
 	var err error
@@ -718,12 +704,7 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 			stmtTimeout = stmtTimeoutOverride
 		}
 		if stmtTimeout > 0 { // 0 = don't change, use DB level settings
-			if useConnPooling {
-				sqlStmtTimeout = fmt.Sprintf("SET LOCAL statement_timeout TO '%ds';", stmtTimeout)
-			} else {
-				sqlStmtTimeout = fmt.Sprintf("SET statement_timeout TO '%ds';", stmtTimeout)
-			}
-
+			sqlStmtTimeout = fmt.Sprintf("SET LOCAL statement_timeout TO '%ds';", stmtTimeout)
 		}
 		if err != nil {
 			atomic.AddUint64(&totalMetricFetchFailuresCounter, 1)
@@ -731,23 +712,11 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 		}
 	}
 
-	if IsPostgresDBType(md.DBType) {
-		if !useConnPooling {
-			sqlLockTimeout = "SET lock_timeout TO '100ms';"
-		}
-	} else {
-		sqlLockTimeout = ""
-	}
-
 	sqlToExec := sqlLockTimeout + sqlStmtTimeout + sql // bundle timeouts with actual SQL to reduce round-trip times
 	//log.Debugf("Executing SQL: %s", sqlToExec)
 	t1 := time.Now()
 	if IsPostgresDBType(md.DBType) {
-		if useConnPooling {
-			data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
-		} else {
-			data, err = DBExecRead(conn, dbUnique, sqlToExec, args...)
-		}
+		data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
 	} else {
 		for _, sql := range strings.Split(sqlToExec, ";") {
 			sql = strings.TrimSpace(sql)
@@ -1185,7 +1154,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 	log.Debugf("COPY-ing %d metrics to Postgres metricsDB...", rows_batched)
 	t1 := time.Now()
 
-	txn, err := metricDb.Begin()
+	txn, err := metricDb.Begin(context.Background())
 	if err != nil {
 		log.Error("Could not start Postgres metricsDB transaction:", err)
 		atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
@@ -1193,12 +1162,12 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 	}
 	defer func() {
 		if err == nil {
-			tx_err := txn.Commit()
+			tx_err := txn.Commit(context.Background())
 			if tx_err != nil {
 				log.Debug("COPY Commit to Postgres failed:", tx_err)
 			}
 		} else {
-			tx_err := txn.Rollback()
+			tx_err := txn.Rollback(context.Background())
 			if tx_err != nil {
 				log.Debug("COPY Rollback to Postgres failed:", tx_err)
 			}
@@ -1206,10 +1175,11 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 	}()
 
 	for metricName, metrics := range metricsToStorePerMetric {
-		var stmt *go_sql.Stmt
+		var stmt *pgconn.StatementDescription
 
 		if PGSchemaType == "custom" {
-			stmt, err = txn.Prepare(pq.CopyIn("metrics", "time", "dbname", "metric", "data", "tag_data"))
+			stmt, err = txn.Prepare(context.Background(), "copyCustom", pq.CopyIn("metrics", "time", "dbname", "metric", "data", "tag_data"))
+
 			if err != nil {
 				log.Error("Could not prepare COPY to 'metrics' table:", err)
 				atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
@@ -1217,7 +1187,7 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 			}
 		} else {
 			log.Debugf("COPY-ing %d rows into '%s'...", len(metrics), metricName)
-			stmt, err = txn.Prepare(pq.CopyIn(metricName, "time", "dbname", "data", "tag_data"))
+			stmt, err = txn.Prepare(context.Background(), "copy", pq.CopyIn(metricName, "time", "dbname", "data", "tag_data"))
 			if err != nil {
 				log.Errorf("Could not prepare COPY to '%s' table: %v", metricName, err)
 				atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
@@ -1241,7 +1211,8 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 					goto stmt_close
 				}
 				if PGSchemaType == "custom" {
-					_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags))
+					pgconn.Pre
+					_, err = txn.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags))
 				} else {
 					_, err = stmt.Exec(m.Time, m.DBName, string(jsonBytes), string(jsonBytesTags))
 				}
@@ -5225,7 +5196,6 @@ type Options struct {
 	AdHocUniqueName         string `long:"adhoc-name" description:"Ad-hoc mode: Unique 'dbname' for Influx. [Default: adhoc]" default:"adhoc" env:"PW2_ADHOC_NAME"`
 	InternalStatsPort       int64  `long:"internal-stats-port" description:"Port for inquiring monitoring status in JSON format. [Default: 8081]" default:"8081" env:"PW2_INTERNAL_STATS_PORT"`
 	DirectOSStats           string `long:"direct-os-stats" description:"Extract OS related psutil statistics not via PL/Python wrappers but directly on host [Default: off]" default:"off" env:"PW2_DIRECT_OS_STATS"`
-	ConnPooling             string `long:"conn-pooling" description:"Enable re-use of metrics fetching connections [Default: off]" default:"off" env:"PW2_CONN_POOLING"`
 	AesGcmKeyphrase         string `long:"aes-gcm-keyphrase" description:"Decryption key for AES-GCM-256 passwords" env:"PW2_AES_GCM_KEYPHRASE"`
 	AesGcmKeyphraseFile     string `long:"aes-gcm-keyphrase-file" description:"File with decryption key for AES-GCM-256 passwords" env:"PW2_AES_GCM_KEYPHRASE_FILE"`
 	AesGcmPasswordToEncrypt string `long:"aes-gcm-password-to-encrypt" description:"A special mode, returns the encrypted plain-text string and quits. Keyphrase(file) must be set. Useful for YAML mode" env:"PW2_AES_GCM_PASSWORD_TO_ENCRYPT"`
