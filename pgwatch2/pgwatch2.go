@@ -378,14 +378,10 @@ func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password
 		}
 		connStr = libPqConnString
 	} else {
-		if strings.Contains(",", host) {
-
-		} else {
-			connStr = fmt.Sprintf("host=%s port=%s dbname='%s' sslmode=%s user=%s application_name=%s sslrootcert='%s' sslcert='%s' sslkey='%s' connect_timeout=5",
-				host, port, dbname, sslmode, user, APPLICATION_NAME, sslrootcert, sslcert, sslkey)
-			if password != "" { // having empty string as password effectively disables .pgpass so include only if password given
-				connStr += fmt.Sprintf(" password='%s'", password)
-			}
+		connStr = fmt.Sprintf("host=%s port=%s dbname='%s' sslmode=%s user=%s application_name=%s sslrootcert='%s' sslcert='%s' sslkey='%s' connect_timeout=5",
+			host, port, dbname, sslmode, user, APPLICATION_NAME, sslrootcert, sslcert, sslkey)
+		if password != "" { // having empty string as password effectively disables .pgpass so include only if password given
+			connStr += fmt.Sprintf(" password='%s'", password)
 		}
 	}
 
