@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"io"
 	"io/ioutil"
@@ -28,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/disk"
@@ -37,7 +35,6 @@ import (
 	"github.com/coreos/go-systemd/daemon"
 	client "github.com/influxdata/influxdb1-client/v2"
 	"github.com/jessevdk/go-flags"
-	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"github.com/marpaia/graphite-golang"
 	"github.com/op/go-logging"
@@ -68,7 +65,7 @@ type MonitoredDatabase struct {
 	SslClientKeyPath     string             `yaml:"sslkey"`
 	Metrics              map[string]float64 `yaml:"custom_metrics"`
 	MetricsStandby       map[string]float64 `yaml:"custom_metrics_standby"`
-	StmtTimeout          int64              `yaml:"stmt_timeout"`
+	StmtTimeout          int32              `yaml:"stmt_timeout"`
 	DBType               string
 	DBNameIncludePattern string            `yaml:"dbname_include_pattern"`
 	DBNameExcludePattern string            `yaml:"dbname_exclude_pattern"`
@@ -129,7 +126,7 @@ type MetricAttrs struct {
 	IsPrivate                 bool                 `yaml:"is_private"`                // used only for extension overrides currently and ignored otherwise
 	DisabledDays              string               `yaml:"disabled_days"`             // Cron style, 0 = Sunday. Ranges allowed: 0,2-4
 	DisableTimes              []string             `yaml:"disabled_times"`            // "11:00-13:00"
-	StatementTimeoutSeconds   int64                `yaml:"statement_timeout_seconds"` // overrides per monitored DB settings
+	StatementTimeoutSeconds   int32                `yaml:"statement_timeout_seconds"` // overrides per monitored DB settings
 }
 
 type MetricVersionProperties struct {
@@ -154,7 +151,7 @@ type MetricFetchMessage struct {
 	DBType              string
 	Interval            time.Duration
 	CreatedOn           time.Time
-	StmtTimeoutOverride int64
+	StmtTimeoutOverride int32
 }
 
 type MetricStoreMessage struct {
@@ -381,10 +378,14 @@ func GetPostgresDBConnection(libPqConnString, host, port, dbname, user, password
 		}
 		connStr = libPqConnString
 	} else {
-		connStr = fmt.Sprintf("host=%s port=%s dbname='%s' sslmode=%s user=%s application_name=%s sslrootcert='%s' sslcert='%s' sslkey='%s' connect_timeout=5",
-			host, port, dbname, sslmode, user, APPLICATION_NAME, sslrootcert, sslcert, sslkey)
-		if password != "" { // having empty string as password effectively disables .pgpass so include only if password given
-			connStr += fmt.Sprintf(" password='%s'", password)
+		if strings.Contains(",", host) {
+
+		} else {
+			connStr = fmt.Sprintf("host=%s port=%s dbname='%s' sslmode=%s user=%s application_name=%s sslrootcert='%s' sslcert='%s' sslkey='%s' connect_timeout=5",
+				host, port, dbname, sslmode, user, APPLICATION_NAME, sslrootcert, sslcert, sslkey)
+			if password != "" { // having empty string as password effectively disables .pgpass so include only if password given
+				connStr += fmt.Sprintf(" password='%s'", password)
+			}
 		}
 	}
 
@@ -532,7 +533,7 @@ func InitSqlConnPoolForMonitoredDBIfNil(md MonitoredDatabase) error {
 	conn.Config().MaxConnLifetime = time.Second * time.Duration(PG_CONN_RECYCLE_SECONDS)
 
 	monitored_db_conn_cache[md.DBUniqueName] = conn
-	log.Debugf("[%s] Connection pool initialized with max %d parallel connections. Conn pooling: %v", md.DBUniqueName, opts.MaxParallelConnectionsPerDb, useConnPooling)
+	log.Debugf("[%s] Connection pool initialized with max %d parallel connections. Conn pooling: %v", md.DBUniqueName, opts.MaxParallelConnectionsPerDb)
 
 	return nil
 }
@@ -589,13 +590,35 @@ func InitPGVersionInfoFetchingLockIfNil(md MonitoredDatabase) {
 	db_pg_version_map_lock.Unlock()
 }
 
+func MapScan(r pgx.Rows, dest map[string]interface{}) error {
+
+	columnsDescription := r.FieldDescriptions()
+
+	log.Debug(fmt.Sprintf("Got %d columns in query result", len(columnsDescription)))
+	values := make([]interface{}, len(columnsDescription))
+	for i := range values {
+		values[i] = new(interface{})
+	}
+
+	err := r.Scan(values...)
+	if err != nil {
+		return err
+	}
+
+	for i, column := range columnsDescription {
+		dest[column.Name] = *(values[i].(*interface{}))
+	}
+
+	return r.Err()
+}
+
 func DBExecRead(conn *pgxpool.Pool, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
 	ret := make([]map[string]interface{}, 0)
 	var rows pgx.Rows
 	var err error
 
 	if conn == nil {
-		return nil, errors.New("nil connection")
+		return nil, errors.New("nil pool")
 	}
 
 	rows, err = conn.Query(context.Background(), sql, args...)
@@ -609,7 +632,7 @@ func DBExecRead(conn *pgxpool.Pool, host_ident, sql string, args ...interface{})
 
 	for rows.Next() {
 		row := make(map[string]interface{})
-		err = rows.Scan(row)
+		err = MapScan(rows, row)
 		if err != nil {
 			log.Error("failed to MapScan a result row", host_ident, err)
 			return nil, err
@@ -624,53 +647,7 @@ func DBExecRead(conn *pgxpool.Pool, host_ident, sql string, args ...interface{})
 	return ret, err
 }
 
-func DBExecInExplicitTX(conn *pgxpool.Pool, host_ident, sql string, args ...interface{}) ([](map[string]interface{}), error) {
-	ret := make([]map[string]interface{}, 0)
-	var rows pgx.Rows
-	var err error
-
-	if conn == nil {
-		return nil, errors.New("nil connection")
-	}
-
-	ctx := context.Background()
-	txOpts := &pgx.TxOptions{
-		AccessMode: pgx.ReadOnly,
-	}
-
-	tx, err := conn.BeginTx(ctx, *txOpts)
-	if err != nil {
-		return ret, err
-	}
-	defer tx.Commit(ctx)
-
-	rows, err = tx.Query(ctx, sql, args...)
-
-	if err != nil {
-		// connection problems or bad queries etc are quite common so caller should decide if to output something
-		log.Debug("failed to query", host_ident, "sql:", sql, "err:", err)
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		row := make(map[string]interface{})
-		err = rows.Scan(row)
-		if err != nil {
-			log.Error("failed to Scan a result row", host_ident, err)
-			return nil, err
-		}
-		ret = append(ret, row)
-	}
-
-	err = rows.Err()
-	if err != nil {
-		log.Error("failed to fully process resultset for", host_ident, "sql:", sql, "err:", err)
-	}
-	return ret, err
-}
-
-func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride int64, sql string, args ...interface{}) ([](map[string]interface{}), error, time.Duration) {
+func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride int32, sql string, args ...interface{}) ([](map[string]interface{}), error, time.Duration) {
 	var conn *pgxpool.Pool
 	var md MonitoredDatabase
 	var data [](map[string]interface{})
@@ -715,14 +692,10 @@ func DBExecReadByDbUniqueName(dbUnique, metricName string, stmtTimeoutOverride i
 	sqlToExec := sqlLockTimeout + sqlStmtTimeout + sql // bundle timeouts with actual SQL to reduce round-trip times
 	//log.Debugf("Executing SQL: %s", sqlToExec)
 	t1 := time.Now()
-	if IsPostgresDBType(md.DBType) {
-		data, err = DBExecInExplicitTX(conn, dbUnique, sqlToExec, args...)
-	} else {
-		for _, sql := range strings.Split(sqlToExec, ";") {
-			sql = strings.TrimSpace(sql)
-			if len(sql) > 0 {
-				data, err = DBExecRead(conn, dbUnique, sql, args...)
-			}
+	for _, sql := range strings.Split(sqlToExec, ";") {
+		sql = strings.TrimSpace(sql)
+		if len(sql) > 0 {
+			data, err = DBExecRead(conn, dbUnique, sql, args...)
 		}
 	}
 	t2 := time.Now()
@@ -846,7 +819,7 @@ func GetMonitoredDatabasesFromConfigDB() ([]MonitoredDatabase, error) {
 			SslRootCAPath:        row["md_root_ca_path"].(string),
 			SslClientCertPath:    row["md_client_cert_path"].(string),
 			SslClientKeyPath:     row["md_client_key_path"].(string),
-			StmtTimeout:          row["md_statement_timeout_seconds"].(int64),
+			StmtTimeout:          row["md_statement_timeout_seconds"].(int32),
 			Metrics:              metricConfig,
 			MetricsStandby:       metricConfigStandby,
 			DBType:               row["md_dbtype"].(string),
@@ -1175,26 +1148,6 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 	}()
 
 	for metricName, metrics := range metricsToStorePerMetric {
-		var stmt *pgconn.StatementDescription
-
-		if PGSchemaType == "custom" {
-			stmt, err = txn.Prepare(context.Background(), "copyCustom", pq.CopyIn("metrics", "time", "dbname", "metric", "data", "tag_data"))
-
-			if err != nil {
-				log.Error("Could not prepare COPY to 'metrics' table:", err)
-				atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-				return err
-			}
-		} else {
-			log.Debugf("COPY-ing %d rows into '%s'...", len(metrics), metricName)
-			stmt, err = txn.Prepare(context.Background(), "copy", pq.CopyIn(metricName, "time", "dbname", "data", "tag_data"))
-			if err != nil {
-				log.Errorf("Could not prepare COPY to '%s' table: %v", metricName, err)
-				atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-				return err
-			}
-		}
-
 		for _, m := range metrics {
 			jsonBytes, err := mapToJson(m.Data)
 			if err != nil {
@@ -1208,46 +1161,60 @@ func SendToPostgres(storeMessages []MetricStoreMessage) error {
 				if err != nil {
 					log.Errorf("Skipping 1 metric for [%s:%s] due to JSON conversion error: %s", m.DBName, m.Metric, err)
 					atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-					goto stmt_close
+					goto close_conn
 				}
 				if PGSchemaType == "custom" {
-					pgconn.Pre
-					_, err = txn.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags))
+					_, err = txn.CopyFrom(context.Background(), pgx.Identifier{"metrics"}, []string{"time", "dbname", "metric", "data", "tag_data"}, pgx.CopyFromRows([][]interface{}{
+						{
+							m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags),
+						},
+					}))
 				} else {
-					_, err = stmt.Exec(m.Time, m.DBName, string(jsonBytes), string(jsonBytesTags))
+					_, err = txn.CopyFrom(context.Background(), pgx.Identifier{"public", metricName}, []string{"time", "dbname", "metric", "data", "tag_data"}, pgx.CopyFromRows([][]interface{}{
+						{
+							m.Time, m.DBName, m.Metric, string(jsonBytes), string(jsonBytesTags),
+						},
+					}))
 				}
 				if err != nil {
-					log.Errorf("Formatting metric %s data to COPY format failed for %s: %v ", m.Metric, m.DBName, err)
+					log.Error("COPY to Postgres failed:", err)
 					atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-					goto stmt_close
+					if strings.Contains(err.Error(), "no partition") {
+						log.Warning("Some metric partitions might have been removed, halting all metric storage. Trying to re-create all needed partitions on next run")
+						forceRecreatePGMetricPartitions = true
+					}
+					goto close_conn
 				}
 			} else {
 				if PGSchemaType == "custom" {
-					_, err = stmt.Exec(m.Time, m.DBName, m.Metric, string(jsonBytes), nil)
+					_, err = txn.CopyFrom(context.Background(), pgx.Identifier{"metrics"}, []string{"time", "dbname", "metric", "data", "tag_data"}, pgx.CopyFromRows([][]interface{}{
+						{
+							m.Time, m.DBName, m.Metric, string(jsonBytes), nil,
+						},
+					}))
 				} else {
-					_, err = stmt.Exec(m.Time, m.DBName, string(jsonBytes), nil)
+					_, err = txn.CopyFrom(context.Background(), pgx.Identifier{"public", metricName}, []string{"time", "dbname", "metric", "data", "tag_data"}, pgx.CopyFromRows([][]interface{}{
+						{
+							m.Time, m.DBName, m.Metric, string(jsonBytes), nil,
+						},
+					}))
 				}
 				if err != nil {
-					log.Errorf("Formatting metric %s data to COPY format failed for %s: %v ", m.Metric, m.DBName, err)
+					log.Error("COPY to Postgres failed:", err)
 					atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-					goto stmt_close
+					if strings.Contains(err.Error(), "no partition") {
+						log.Warning("Some metric partitions might have been removed, halting all metric storage. Trying to re-create all needed partitions on next run")
+						forceRecreatePGMetricPartitions = true
+					}
+					goto close_conn
 				}
 			}
 		}
 
-		_, err = stmt.Exec()
+	close_conn:
+		err = txn.Conn().Close(context.Background())
 		if err != nil {
-			log.Error("COPY to Postgres failed:", err)
-			atomic.AddUint64(&datastoreWriteFailuresCounter, 1)
-			if strings.Contains(err.Error(), "no partition") {
-				log.Warning("Some metric partitions might have been removed, halting all metric storage. Trying to re-create all needed partitions on next run")
-				forceRecreatePGMetricPartitions = true
-			}
-		}
-	stmt_close:
-		err = stmt.Close()
-		if err != nil {
-			log.Error("stmt.Close() failed:", err)
+			log.Error("Close connection was failed:", err)
 		}
 	}
 
@@ -3381,7 +3348,7 @@ func MetricGathererLoop(dbUniqueName, dbUniqueNameOrig, dbType, metricName strin
 	failed_fetches := 0
 	metricNameForStorage := metricName
 	lastDBVersionFetchTime := time.Unix(0, 0) // check DB ver. ev. 5 min
-	var stmtTimeoutOverride int64
+	var stmtTimeoutOverride int32
 
 	if opts.TestdataDays != 0 {
 		if metricName == SPECIAL_METRIC_SERVER_LOG_EVENT_COUNTS || metricName == SPECIAL_METRIC_CHANGE_EVENTS {
@@ -4471,7 +4438,7 @@ func ReadMonitoringConfigFromFileOrFolder(fileOrFolder string) ([]MonitoredDatab
 
 // "resolving" reads all the DB names from the given host/port, additionally matching/not matching specified regex patterns
 func ResolveDatabasesFromConfigEntry(ce MonitoredDatabase) ([]MonitoredDatabase, error) {
-	var c *sqlx.DB
+	var c *pgxpool.Pool
 	var err error
 	md := make([]MonitoredDatabase, 0)
 
@@ -4484,7 +4451,7 @@ func ResolveDatabasesFromConfigEntry(ce MonitoredDatabase) ([]MonitoredDatabase,
 		if err != nil {
 			return md, err
 		}
-		err = c.Ping()
+		err = c.Ping(context.Background())
 		if err == nil {
 			break
 		} else {
@@ -4876,16 +4843,16 @@ func GetGoPsutilDiskTotals() ([]map[string]interface{}, error) {
 }
 
 func getPathUnderlyingDeviceId(path string) (uint64, error) {
-	fp, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	fi, err := fp.Stat()
-	if err != nil {
-		return 0, err
-	}
-	stat := fi.Sys().(*syscall.Stat_t)
-	return stat.Dev, nil
+	//fp, err := os.Open(path)
+	//if err != nil {
+	//	return 0, err
+	//}
+	//fi, err := fp.Stat()
+	//if err != nil {
+	//	return 0, err
+	//}
+	//stat := fi.Sys().(*syscall.Stat_t)
+	return 0, nil
 }
 
 // connects actually to the instance to determine PG relevant disk paths / mounts
@@ -5437,8 +5404,6 @@ func main() {
 	if opts.BatchingDelayMs < 0 || opts.BatchingDelayMs > 3600000 {
 		log.Fatal("--batching-delay-ms must be between 0 and 3600000")
 	}
-
-	useConnPooling = StringToBoolOrFail(opts.ConnPooling, "--conn-pooling")
 
 	if pgBouncerNumericCountersStartVersion, err = decimal.NewFromString("1.12"); err != nil {
 		log.Fatal("Could not convert string '1.12' to decimal")

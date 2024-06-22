@@ -1,0 +1,81 @@
+# To demonstrate how to set up pgwatch2 in a loosely coupled way
+
+version: "3"
+services:
+  postgres:
+    image: postgres:14
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+  db-bootstrapper-configdb:
+    image: cybertec/pgwatch2-db-bootstrapper:latest
+    environment:
+      PGHOST: postgres
+      BOOTSTRAP_TYPE: configdb
+      BOOTSTRAP_DATABASE: pgwatch2
+      BOOTSTRAP_ADD_TEST_MONITORING_ENTRY: 1
+    depends_on:
+      - postgres
+  webui:
+    image: cybertec/pgwatch2-webui:latest
+    environment:
+      PW2_PGHOST: postgres
+      PW2_WEBUSER: pgwatch2
+      PW2_WEBPASSWORD: pgwatch2
+      PW2_WEBNOANONYMOUS: true
+      PW2_DATASTORE: prometheus
+    ports:
+      - "18080:8080"
+    depends_on:
+      - db-bootstrapper-configdb
+  pgwatch2-daemon:
+    image: cvitoybamp/pgwatch2:v1.0.0
+    environment:
+      PW2_VERBOSE: debug
+      PW2_DATASTORE: prometheus
+      PW2_PROMETHEUS_ASYNC_MODE: true
+      PW2_PROMETHEUS_PORT: 9187
+      PW2_PGHOST: postgres
+    ports:
+      - "18081:8081"
+      - "18082:9187"
+    depends_on:
+      - db-bootstrapper-configdb
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - pgwatch2-daemon
+      - webui
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/prometheus/datasource.yml:/etc/grafana/provisioning/datasources/main.yaml
+      - ./grafana/prometheus/dashboards/dashboard.yml:/etc/grafana/provisioning/dashboards/main.yaml
+      - ./grafana/prometheus/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    depends_on:
+      - pgwatch2-daemon
+      - webui
+  testdb:
+    image: postgres:14
+    ports:
+      - "15433:5432"
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    volumes:
+      - ./init/init.sql:/docker-entrypoint-initdb.d/init.sql
+    depends_on:
+      - pgwatch2-daemon
+      - webui
